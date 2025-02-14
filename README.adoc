@@ -1,0 +1,8 @@
+= calendar-fast
+:revdate: 2025-02-14
+:author: Paweł Kruszec
+:email: pakruszec@gmail.com
+
+.Building
+On Windows, just run `build.bat`.
+The program only uses the standard library, so you can compile it with `rustc` on any platform that implements std.
