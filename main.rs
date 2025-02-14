@@ -165,20 +165,25 @@ fn write_contents<W: Write>(path: &str, buf: &mut BufWriter<W>) -> io::Result<()
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
-    // TODO: improve this?
+    // We read chunks of input and write it to the output.
+    // We could just read it all into a string, but that would require allocations.
     let mut tmp = [0u8; 256];
-    let mut first = true;
 
     loop {
         let read = reader.read(&mut tmp)?;
-        if read >= 3 && tmp[..3] == [0xEF, 0xBB, 0xBF] {
-            // Skip BOM
-            buf.write(&tmp[3..read])?;
+
+        // If we find BOM at the beginning of the buffer, we trim it.
+        // This has a side effect - some BOMs are removed, even if they are not at the beginning of the file.
+        // It may be fine, but it requires some testing regarding how Asciidoctor handles that.
+        // (BOMs after the beginning of the file should probably not happen).
+        const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+        if read >= BOM.len() && tmp[..BOM.len()] == BOM {
+            buf.write(&tmp[BOM.len()..read])?;
         } else {
             buf.write(&tmp[..read])?;
         }
 
-        first = false;
         if read < tmp.len() { break; }
     }
 
@@ -211,8 +216,6 @@ fn main() -> ExitCode {
     let mut out_path = String::from("calendar.adoc");
     let mut header_path: Option<String> = None;
     let mut footer_path: Option<String> = None;
-
-    // TODO: help update
 
     while let Some(arg) = args.next() {
         if arg == "-h" || arg == "--help" {
