@@ -16,6 +16,7 @@ struct Date {
 struct Doc {
     path: String,
     revdate: Option<Date>,
+    imagesdir: Option<String>,
 }
 
 fn usage(prog: &str) {
@@ -89,6 +90,7 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
     let mut doc = Doc {
         path: path.to_string_lossy().to_string(),
         revdate: None,
+        imagesdir: None,
     };
 
     for (ln, line) in lines.enumerate() {
@@ -121,13 +123,21 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
         if !comment {
             if line.starts_with("include::") { return Ok(None); }
 
-            let revdate = try_parse_date(line, ":revdate: ");
-            if let Err(err) = revdate {
-                return Err(error_with_file_and_line(path, ln, err));
+            if let None = doc.revdate {
+                let revdate = try_parse_date(line, ":revdate: ");
+                if let Err(err) = revdate {
+                    return Err(error_with_file_and_line(path, ln, err));
+                }
+                if let Some(date) = revdate? {
+                    doc.revdate = Some(date);
+                }
             }
 
-            if let Some(date) = revdate? {
-                doc.revdate = Some(date);
+            if let None = doc.imagesdir {
+                let line_no_prefix = line.strip_prefix(":imagesdir: ");
+                if let Some(line_no_prefix) = line_no_prefix {
+                    doc.imagesdir = Some(line_no_prefix.to_owned());
+                }
             }
         }
     }
@@ -194,10 +204,20 @@ fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item
     let file = File::create(path)?;
     let mut buf = BufWriter::new(file);
 
+    
     buf.write(header.as_bytes())?;
     buf.write("\n\n:leveloffset: +1\n\n".as_bytes())?;
-
+    
     for doc in docs {
+        // HACK
+        if let None = &doc.imagesdir {
+            let p = Path::new(&doc.path);
+            // TODO: unwrap
+            let parent = p.parent().unwrap().to_str().unwrap();
+            let parent_fwd = str::replace(parent, "\\", "/");
+            buf.write(format!(":imagesdir: {}\n", parent_fwd).as_bytes())?;
+        }
+
         write_contents(&doc.path, &mut buf)?;
         buf.write("\n\n".as_bytes())?;
     }
