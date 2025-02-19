@@ -1,3 +1,4 @@
+
 use std::env;
 use std::process::ExitCode;
 use std::io::{self, BufRead, BufReader, Error, ErrorKind, BufWriter, Write, Read};
@@ -16,7 +17,8 @@ struct Date {
 struct Doc {
     path: String,
     revdate: Option<Date>,
-    imagesdir: Option<String>,
+    content: String,
+    has_imagesdir: bool,
 }
 
 fn usage(prog: &str) {
@@ -75,6 +77,8 @@ fn try_parse_date(line: &str, prefix: &'static str) -> io::Result<Option<Date>> 
     }
 }
 
+static BOM: &'static str = unsafe { std::str::from_utf8_unchecked(&[0xEF, 0xBB, 0xBF]) };
+
 fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
     let file = File::open(path);
     if let Err(err) = file {
@@ -90,7 +94,8 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
     let mut doc = Doc {
         path: path.to_string_lossy().to_string(),
         revdate: None,
-        imagesdir: None,
+        content: String::new(),
+        has_imagesdir: false,
     };
 
     for (ln, line) in lines.enumerate() {
@@ -98,6 +103,7 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
             return Err(error_with_file_and_line(path, ln, err));
         }
         let line = line?;
+        let mut line_original = &line[..];
         let line = line.trim();
 
         if line == "////" {
@@ -119,6 +125,8 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
             }
         }
 
+        let mut imagesdir: Option<String> = None;
+
         let comment = cmt_block || cmt_section;
         if !comment {
             if line.starts_with("include::") { return Ok(None); }
@@ -133,11 +141,29 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
                 }
             }
 
-            if let None = doc.imagesdir {
-                let line_no_prefix = line.strip_prefix(":imagesdir: ");
-                if let Some(line_no_prefix) = line_no_prefix {
-                    doc.imagesdir = Some(line_no_prefix.to_owned());
-                }
+            let id = line.strip_prefix(":imagesdir: ");
+            if let Some(id) = id {
+                imagesdir = Some(id.to_string());
+            }
+        }
+
+        if let Some(nb) = line_original.strip_prefix(BOM) {
+            line_original = nb;
+        }
+
+        doc.content.push_str(&line_original);
+        doc.content.push_str("\n");
+
+        if let Some(dir) = imagesdir {
+            doc.has_imagesdir = true;
+
+            let p = Path::new(&dir);
+            // HACK: unwrap
+            // TODO: Actual is url
+            if !p.has_root() && !p.starts_with("http://") && !p.starts_with("https://") {
+                doc.content.push_str(":imagesdir: ");
+                doc.content.push_str(&str::replace(path.parent().unwrap().join(p).to_str().unwrap(), "\\", "/"));
+                doc.content.push_str("\n");
             }
         }
     }
@@ -171,35 +197,6 @@ fn traverse(path: &Path, out: &mut Vec<Doc>) -> io::Result<()> {
     Ok(())
 }
 
-fn write_contents<W: Write>(path: &str, buf: &mut BufWriter<W>) -> io::Result<()> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-
-    // We read chunks of input and write it to the output.
-    // We could just read it all into a string, but that would require allocations.
-    let mut tmp = [0u8; 256];
-
-    loop {
-        let read = reader.read(&mut tmp)?;
-
-        // If we find BOM at the beginning of the buffer, we trim it.
-        // This has a side effect - some BOMs are removed, even if they are not at the beginning of the file.
-        // It may be fine, but it requires some testing regarding how Asciidoctor handles that.
-        // (BOMs after the beginning of the file should probably not happen).
-        const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
-
-        if read >= BOM.len() && tmp[..BOM.len()] == BOM {
-            buf.write(&tmp[BOM.len()..read])?;
-        } else {
-            buf.write(&tmp[..read])?;
-        }
-
-        if read < tmp.len() { break; }
-    }
-
-    Ok(())
-}
-
 fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item = &'a Doc>) -> io::Result<()> {
     let file = File::create(path)?;
     let mut buf = BufWriter::new(file);
@@ -209,8 +206,7 @@ fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item
     buf.write("\n\n:leveloffset: +1\n\n".as_bytes())?;
     
     for doc in docs {
-        // HACK
-        if let None = &doc.imagesdir {
+        if !doc.has_imagesdir {
             let p = Path::new(&doc.path);
             // TODO: unwrap
             let parent = p.parent().unwrap().to_str().unwrap();
@@ -218,7 +214,7 @@ fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item
             buf.write(format!(":imagesdir: {}\n", parent_fwd).as_bytes())?;
         }
 
-        write_contents(&doc.path, &mut buf)?;
+        buf.write(doc.content.as_bytes())?;
         buf.write("\n\n".as_bytes())?;
     }
 
