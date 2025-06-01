@@ -38,14 +38,19 @@ struct Doc {
 
 fn usage() {
     eprintln!(
-"usage: calendar_fast [-h|--help] [-o <path>] [--header <path>] [--start-date <date>] [--end-date <date>] <src_path>
-  -h, --help    print this and exit
-  -o            output path
-  --header      header path (its contents will go to the beginning of the file)
-  --footer      footer path (its contents will go to the end of the file)
-  --start-date  start date (inclusive)
-  --end-date    end date (inclusive)
+"usage: calendar_fast [-h|--help] [-v|--version] [-o <path>] [--header <path>] [--start-date <date>] [--end-date <date>] <src_path>
+  -h, --help     print this and exit
+  -v, --version  print version number
+  -o             output path
+  --header       header path (its contents will go to the beginning of the file)
+  --footer       footer path (its contents will go to the end of the file)
+  --start-date   start date (inclusive)
+  --end-date     end date (inclusive)
 ");
+}
+
+fn version() {
+   eprintln!("calendar_fast build 2025-06-01"); 
 }
 
 fn error(text: String) -> Error {
@@ -263,6 +268,9 @@ fn main() -> ExitCode {
 
         if arg == "-h" || arg == "--help" {
             usage();
+            return ExitCode::SUCCESS;
+        } else if arg == "-v" || arg == "--version" {
+            version();
             return ExitCode::SUCCESS;
         } else if arg == "--header" {
             // TODO: good error message
