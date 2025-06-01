@@ -4,7 +4,3 @@
 :email: pakruszec@gmail.com
 
 Faster version of link:https://github.com/pkruszec/vicx/blob/master/calendar.rb[calendar.rb].
-
-.Building
-On Windows, just run `build.bat`.
-The program only uses the standard library, so you can just compile `main.rs` with `rustc` on any platform that implements std.
