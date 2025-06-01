@@ -264,44 +264,53 @@ fn main() -> ExitCode {
     let mut end_date = Date { year: u16::MAX, month: u8::MAX, day: u8::MAX };
 
     while let Some(arg) = args.next() {
-        // TODO: switch to match
-
-        if arg == "-h" || arg == "--help" {
-            usage();
-            return ExitCode::SUCCESS;
-        } else if arg == "-v" || arg == "--version" {
-            version();
-            return ExitCode::SUCCESS;
-        } else if arg == "--header" {
-            // TODO: good error message
-            header_path = Some(args.next().unwrap());
-        } else if arg == "--footer" {
-            // TODO: good error message
-            footer_path = Some(args.next().unwrap());
-        } else if arg == "-o" {
-            // TODO: good error message
-            out_path = args.next().unwrap();
-        } else if arg == "--start-date" {
-            start_date = match try_parse_date(&args.next().unwrap()) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::from(1);
+        match arg.as_str() {
+            "-h" | "--help" => {
+                usage();
+                return ExitCode::SUCCESS;
+            }
+            "-v" | "--version" => {
+                version();
+                return ExitCode::SUCCESS;
+            }
+            "--header" => {
+                // TODO: good error message
+                header_path = Some(args.next().unwrap());
+            }
+            "--footer" => {
+                // TODO: good error message
+                footer_path = Some(args.next().unwrap());
+            }
+            "-o" => {
+                // TODO: good error message
+                out_path = args.next().unwrap();
+            }
+            "--start-date" => {
+                start_date = match try_parse_date(&args.next().unwrap()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(1);
+                    }
                 }
             }
-        } else if arg == "--end-date" {
-            end_date = match try_parse_date(&args.next().unwrap()) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::from(1);
+            "--end-date" => {
+                end_date = match try_parse_date(&args.next().unwrap()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(1);
+                    }
                 }
             }
-        } else if let Some(_) = src_dir {
-            eprintln!("error: unexpected positional argument (multiple source directories are currently not supported)");
-            return ExitCode::from(1);
-        } else {
-            src_dir = Some(arg);
+            _ => {
+                if let Some(_) = src_dir {
+                    eprintln!("error: unexpected positional argument (multiple source directories are currently not supported)");
+                    return ExitCode::from(1);
+                } else {
+                    src_dir = Some(arg);
+                }
+            }
         }
     }
 
