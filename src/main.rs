@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, u16};
 use std::process::ExitCode;
 use std::io::{self, BufRead, BufReader, Error, ErrorKind, BufWriter, Write};
 use std::fs::{self, File};
@@ -13,6 +13,22 @@ struct Date {
     day: u8,
 }
 
+impl Date {
+    fn ge(&self, other: &Self) -> bool {
+        if self.year > other.year { return true; }
+        if self.year == other.year && self.month > other.month { return true; }
+        if self.year == other.year && self.month == other.month && self.day >= other.day { return true; }
+        false
+    }
+
+    fn le(&self, other: &Self) -> bool {
+        if self.year < other.year { return true; }
+        if self.year == other.year && self.month < other.month { return true; }
+        if self.year == other.year && self.month == other.month && self.day <= other.day { return true; }
+        false
+    }
+}
+
 struct Doc {
     path: String,
     revdate: Option<Date>,
@@ -20,16 +36,16 @@ struct Doc {
     has_imagesdir: bool,
 }
 
-fn usage(prog: &str) {
+fn usage() {
     eprintln!(
-"usage: {} [flags] <src-dir>
-flags available:
-  -h, --help  Show the usage and exit
-  -o          Output path
-  --header    Header path
-  --footer    Footer path
-",
-    prog);
+"usage: calendar_fast [-h|--help] [-o <path>] [--header <path>] [--start-date <date>] [--end-date <date>] <src_path>
+  -h, --help    print this and exit
+  -o            output path
+  --header      header path (its contents will go to the beginning of the file)
+  --footer      footer path (its contents will go to the end of the file)
+  --start-date  start date (inclusive)
+  --end-date    end date (inclusive)
+");
 }
 
 fn error(text: String) -> Error {
@@ -44,8 +60,7 @@ fn error_with_file_and_line(path: &Path, line: usize, err: Error) -> Error {
     Error::new(ErrorKind::Other, format!("{}:{}: {}", path.display(), line + 1, err))
 }
 
-fn try_parse_date(line: &str, prefix: &'static str) -> io::Result<Option<Date>> {
-    if let Some(date) = line.strip_prefix(prefix) {
+fn try_parse_date(date: &str) -> io::Result<Date> {
         let len = 4 + 1 + 2 + 1 + 2;
         let mut ok = date.len() == len;
 
@@ -67,10 +82,18 @@ fn try_parse_date(line: &str, prefix: &'static str) -> io::Result<Option<Date>> 
         }
 
         if !ok {
-            return Err(error(format!("Could not parse date '{}'", date)));
+            return Err(error(format!("could not parse date '{}'", date)));
         }
 
-        Ok(Some(Date {year, month, day}))
+        Ok(Date {year, month, day})
+}
+
+fn try_parse_date_with_prefix(line: &str, prefix: &'static str) -> io::Result<Option<Date>> {
+    if let Some(date) = line.strip_prefix(prefix) {
+        match try_parse_date(date) {
+            Ok(d) => Ok(Some(d)),
+            Err(e) => Err(e),
+        }
     } else {
         Ok(None)
     }
@@ -131,7 +154,7 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
             if line.starts_with("include::") { return Ok(None); }
 
             if let None = doc.revdate {
-                let revdate = try_parse_date(line, ":revdate: ");
+                let revdate = try_parse_date_with_prefix(line, ":revdate: ");
                 if let Err(err) = revdate {
                     return Err(error_with_file_and_line(path, ln, err));
                 }
@@ -225,16 +248,21 @@ fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item
 
 fn main() -> ExitCode {
     let mut args = env::args();
-    let prog = args.next().unwrap();
+    args.next().unwrap();
 
     let mut src_dir: Option<String> = None;
     let mut out_path = String::from("calendar.adoc");
     let mut header_path: Option<String> = None;
     let mut footer_path: Option<String> = None;
 
+    let mut start_date = Date { year: 0, month: 0, day: 0 };
+    let mut end_date = Date { year: u16::MAX, month: u8::MAX, day: u8::MAX };
+
     while let Some(arg) = args.next() {
+        // TODO: switch to match
+
         if arg == "-h" || arg == "--help" {
-            usage(&prog);
+            usage();
             return ExitCode::SUCCESS;
         } else if arg == "--header" {
             // TODO: good error message
@@ -245,6 +273,22 @@ fn main() -> ExitCode {
         } else if arg == "-o" {
             // TODO: good error message
             out_path = args.next().unwrap();
+        } else if arg == "--start-date" {
+            start_date = match try_parse_date(&args.next().unwrap()) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else if arg == "--end-date" {
+            end_date = match try_parse_date(&args.next().unwrap()) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            }
         } else if let Some(_) = src_dir {
             eprintln!("error: unexpected positional argument (multiple source directories are currently not supported)");
             return ExitCode::from(1);
@@ -254,7 +298,7 @@ fn main() -> ExitCode {
     }
 
     if let None = src_dir {
-        usage(&prog);
+        usage();
         eprintln!("error: source directory not provided");
         return ExitCode::from(1);
     }
@@ -320,7 +364,13 @@ fn main() -> ExitCode {
         Ordering::Equal
     });
 
-    match generate(&out_path, &header, &footer, docs.iter()) {
+    match generate(&out_path, &header, &footer, docs.iter().filter(|doc| {
+        if let Some(date) = doc.revdate {
+            date.ge(&start_date) && date.le(&end_date)
+        } else {
+            false
+        }
+    })) {
         Ok(_) => {},
         Err(err) => {
             eprintln!("error: {err}");
