@@ -4,6 +4,7 @@ use std::io::{self, BufRead, BufReader, Error, ErrorKind, BufWriter, Write};
 use std::fs::{self, File};
 use std::path::Path;
 use std::cmp::Ordering;
+use std::thread;
 
 #[derive(Clone, Copy)]
 #[derive(Debug)]
@@ -38,10 +39,13 @@ struct Doc {
 
 fn usage() {
     eprintln!(
-"usage: calendar_fast [-h|--help] [-v|--version] [-o <path>] [--header <path>] [--start-date <date>] [--end-date <date>] <src_path>
+"usage: calendar_fast [-h|--help] [-v|--version] [-o <path>] [-p<n>] [--header <path>] [--start-date <date>] [--end-date <date>] <src_path>
   -h, --help     print this and exit
   -v, --version  print version number
   -o             output path
+  -p<n>          parallelization mode
+    -p0            no parallelization
+    -p1            parallelize by first folder (experimental)
   --header       header path (its contents will go to the beginning of the file)
   --footer       footer path (its contents will go to the end of the file)
   --start-date   start date (inclusive)
@@ -50,7 +54,7 @@ fn usage() {
 }
 
 fn version() {
-   eprintln!("calendar_fast build 2025-06-01"); 
+   eprintln!("calendar_fast build 2025-08-27"); 
 }
 
 fn error(text: String) -> Error {
@@ -259,6 +263,7 @@ fn main() -> ExitCode {
     let mut out_path = String::from("calendar.adoc");
     let mut header_path: Option<String> = None;
     let mut footer_path: Option<String> = None;
+    let mut parallelize: i32 = 0;
 
     let mut start_date = Date { year: 0, month: 0, day: 0 };
     let mut end_date = Date { year: u16::MAX, month: u8::MAX, day: u8::MAX };
@@ -284,6 +289,12 @@ fn main() -> ExitCode {
             "-o" => {
                 // TODO: good error message
                 out_path = args.next().unwrap();
+            }
+            "-p0" => {
+                parallelize = 0;
+            }
+            "-p1" => {
+                parallelize = 1;
             }
             "--start-date" => {
                 start_date = match try_parse_date(&args.next().unwrap()) {
@@ -328,6 +339,11 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    if !src_path.is_dir() {
+        eprintln!("error: source path is not a directory");
+        return ExitCode::from(1);
+    }
+
     // TODO: unwrap
 
     let header = if let Some(path) = header_path {
@@ -344,13 +360,35 @@ fn main() -> ExitCode {
 
     let mut docs: Vec<Doc> = Vec::new();
 
-    match traverse(src_path, &mut docs) {
-        Ok(_) => {},
-        Err(err) => {
-            eprintln!("error: {err}");
-            return ExitCode::from(1);
+    if parallelize == 1 {
+        let mut handles = Vec::new();
+    
+        for entry in fs::read_dir(src_path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+    
+            let handle = thread::spawn(move || {
+                let mut sub_docs: Vec<Doc> = Vec::new();
+                traverse(&path, &mut sub_docs).unwrap();
+                sub_docs
+            });
+    
+            handles.push(handle);
         }
-    };
+    
+        for handle in handles {
+            let v = handle.join().unwrap();
+            docs.extend(v);
+        }
+    } else if parallelize == 0 {
+        match traverse(src_path, &mut docs) {
+            Ok(_) => {},
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::from(1);
+            }
+        };
+    }
 
     docs.sort_by(|a, b| {
         // Sort by revdates in descending order (newest on the top).
