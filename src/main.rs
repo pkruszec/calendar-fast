@@ -35,6 +35,8 @@ struct Doc {
     path: String,
     revdate: Option<Date>,
     content: String,
+    title: String,
+    id: String,
     has_imagesdir: bool,
 }
 
@@ -49,6 +51,7 @@ fn usage() {
   --start-date   YYYY-MM-DD   Start date (inclusive).
   --end-date     YYYY-MM-DD   End date (inclusive).
   --imglink                   Replace images with links (will not work correctly on variable expansions).
+  --order-by     revdate|title|id
 ");
 }
 
@@ -126,6 +129,8 @@ fn parse_doc(path: &Path, replace_images_with_links: bool) -> io::Result<Option<
         revdate: None,
         content: String::new(),
         has_imagesdir: false,
+        title: String::from(""),
+        id: String::from(""),
     };
 
     let mut doc_imagesdir: Option<String> = None;
@@ -135,8 +140,13 @@ fn parse_doc(path: &Path, replace_images_with_links: bool) -> io::Result<Option<
             return Err(error_with_file_and_line(path, ln, err));
         }
         let line = line?;
+
         let mut line_original = &line[..];
-        let line = line.trim();
+        if let Some(nb) = line_original.strip_prefix(BOM) {
+            line_original = nb;
+        }
+
+        let line = line_original.trim();
 
         if line == "////" {
             cmt_block = !cmt_block;
@@ -177,10 +187,6 @@ fn parse_doc(path: &Path, replace_images_with_links: bool) -> io::Result<Option<
             if let Some(id) = id {
                 imagesdir = Some(id.to_string());
             }
-        }
-
-        if let Some(nb) = line_original.strip_prefix(BOM) {
-            line_original = nb;
         }
 
         let mut pushed = false;
@@ -226,6 +232,23 @@ fn parse_doc(path: &Path, replace_images_with_links: bool) -> io::Result<Option<
             }
         }
 
+        if !comment {
+            if doc.title == "" && line.starts_with("= ") {
+                doc.title = String::from(&line[2..]);
+            }
+
+            // We only treat these things before the title as ID
+            if doc.title == "" && doc.id == "" {
+                if line.starts_with("[#") && line.ends_with("]") {
+                    doc.id = String::from(&line[2..line.len() - 1]);
+                }
+
+                if line.starts_with("[[") &&  line.ends_with("]]") {
+                    doc.id = String::from(&line[2..line.len() - 2]);
+                }
+            }
+        }
+
         if !pushed { doc.content.push_str(&line_original); }
         doc.content.push_str("\n");
 
@@ -247,7 +270,7 @@ fn parse_doc(path: &Path, replace_images_with_links: bool) -> io::Result<Option<
             let p = Path::new(&dir);
             // If we can safely assume this is a local path, we override the imagesdir
             // with the actual path so that you can get to the image.
-            // TODO: This is not a very good way to determine if the path is a URL. 
+            // TODO: This is not a very good way to determine if the path is a URL.
             // HACK: unwrap
             if !maybe_a_variable_expansion && !p.has_root() &&
                !p.starts_with("http://") && !p.starts_with("https://")
@@ -267,10 +290,10 @@ fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item
     let mut buf = BufWriter::new(file);
 
     let mut count_generated = 0;
-    
+
     buf.write(header.as_bytes())?;
     buf.write("\n\n:leveloffset: +1\n\n".as_bytes())?;
-    
+
     for doc in docs {
         if !doc.has_imagesdir {
             let p = Path::new(&doc.path);
@@ -281,7 +304,7 @@ fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item
             if let Some(s) = parent.strip_prefix("//?/") {
                 parent = s.to_string();
             }
-            
+
             buf.write(format!(":imagesdir: {}\n", parent).as_bytes())?;
         }
 
@@ -315,28 +338,36 @@ fn get_adoc_files(path: &Path, files: &mut HashSet<PathBuf>) -> io::Result<()> {
         }
         files.insert(fs::canonicalize(path).unwrap());
     }
-    
+
     Ok(())
+}
+
+enum OrderBy {
+    Revdate,
+    Title,
+    ID,
 }
 
 fn main() -> ExitCode {
     let perf_total = Instant::now();
-    
+
     let mut args = env::args();
     args.next().unwrap();
 
     let mut src_dirs: Vec<String> = Vec::new();
-    
+
     let mut out_path = String::from("calendar.adoc");
     let mut header_path: Option<String> = None;
     let mut footer_path: Option<String> = None;
-    
+
     let mut start_date = Date { year: 0, month: 0, day: 0 };
     let mut end_date = Date { year: u16::MAX, month: u8::MAX, day: u8::MAX };
     let mut date_bounds_specified = false;
-    
+
     let mut replace_images_with_links = false;
-    
+
+    let mut order_by = OrderBy::Revdate;
+
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -401,6 +432,25 @@ fn main() -> ExitCode {
             "--imglink" => {
                 replace_images_with_links = true;
             }
+            "--order-by" => {
+                order_by = match args.next() {
+                    Some(what) => {
+                        match what.as_str() {
+                            "revdate" => OrderBy::Revdate,
+                            "title" => OrderBy::Title,
+                            "id" => OrderBy::ID,
+                            &_ => {
+                                eprintln!("Error: --order-by is either 'revdate', 'title', or 'id'.");
+                                return ExitCode::from(1);
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("Error: You typed --order-by, but didn't specify what to order by.");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             _ => {
                 src_dirs.push(arg);
             }
@@ -428,12 +478,12 @@ fn main() -> ExitCode {
     };
 
     let perf_traverse = Instant::now();
-    
+
     let mut files: HashSet<PathBuf> = HashSet::new();
-    
+
     for dir in src_dirs {
         let path = Path::new(&dir);
-        
+
         if !path.exists() {
             eprintln!("Error: Source directory '{}' does not exist.", path.display());
             return ExitCode::from(1);
@@ -454,11 +504,11 @@ fn main() -> ExitCode {
     }
 
     let perf_traverse = perf_traverse.elapsed();
-    
+
     println!("AsciiDoc files found: {}.", files.len());
 
     let perf_parse = Instant::now();
-    
+
     let mut docs: Vec<Doc> = Vec::new();
     for path in files {
         let doc = parse_doc(&path, replace_images_with_links).unwrap();
@@ -472,35 +522,72 @@ fn main() -> ExitCode {
     let perf_parse = perf_parse.elapsed();
 
     let perf_output = Instant::now();
-    
-    docs.sort_by(|a, b| {
-        // Sort by revdates in descending order (newest on the top).
 
-        let l = a.revdate;
-        let r = b.revdate;
+    match order_by {
+        OrderBy::Revdate => {
+            docs.sort_by(|a, b| {
+                // Sort by revdates in descending order (newest on the top).
 
-        // TODO: Make it more concise
-        if l.is_none() && r.is_none() {
-            return Ordering::Equal;
-        } else if l.is_none() {
-            return Ordering::Greater;
-        } else if r.is_none() {
-            return Ordering::Less;
+                let l = a.revdate;
+                let r = b.revdate;
+
+                if l.is_none() && r.is_none() {
+                    return Ordering::Equal;
+                } else if l.is_none() {
+                    return Ordering::Greater;
+                } else if r.is_none() {
+                    return Ordering::Less;
+                }
+
+                let l = l.unwrap();
+                let r = r.unwrap();
+
+                let y = r.year.cmp(&l.year);
+                let m = r.month.cmp(&l.month);
+                let d = r.day.cmp(&l.day);
+
+                if y != Ordering::Equal { return y; }
+                if m != Ordering::Equal { return m; }
+                if d != Ordering::Equal { return d; }
+
+                Ordering::Equal
+            });
         }
 
-        let l = l.unwrap();
-        let r = r.unwrap();
+        OrderBy::Title => {
+            docs.sort_by(|a, b| {
+                let l = &a.title;
+                let r = &b.title;
 
-        let y = r.year.cmp(&l.year);
-        let m = r.month.cmp(&l.month);
-        let d = r.day.cmp(&l.day);
+                if l == "" && r == "" {
+                    return Ordering::Equal;
+                } else if l == "" {
+                    return Ordering::Greater;
+                } else if r == "" {
+                    return Ordering::Less;
+                }
 
-        if y != Ordering::Equal { return y; }
-        if m != Ordering::Equal { return m; }
-        if d != Ordering::Equal { return d; }
+                l.cmp(&r)
+            });
+        }
 
-        Ordering::Equal
-    });
+        OrderBy::ID => {
+            docs.sort_by(|a, b| {
+                let l = &a.id;
+                let r = &b.id;
+
+                if l == "" && r == "" {
+                    return Ordering::Equal;
+                } else if l == "" {
+                    return Ordering::Greater;
+                } else if r == "" {
+                    return Ordering::Less;
+                }
+
+                l.cmp(&r)
+            });
+        }
+    }
 
     let docs_filtered = docs.iter().filter(|doc| {
         if let Some(date) = doc.revdate {
@@ -509,7 +596,7 @@ fn main() -> ExitCode {
             !date_bounds_specified
         }
     });
-    
+
     match generate(&out_path, &header, &footer, docs_filtered) {
         Ok(count) => {
             println!("Documents   included: {count}.");
@@ -521,7 +608,7 @@ fn main() -> ExitCode {
     };
 
     let perf_output = perf_output.elapsed();
-    
+
     let perf_total = perf_total.elapsed();
 
     println!("");
@@ -530,6 +617,6 @@ fn main() -> ExitCode {
     println!("Output   time: {:.5} s.", perf_output.as_secs_f32());
     println!("Other    time: {:.5} s.", (perf_total - (perf_traverse + perf_parse + perf_output)).as_secs_f32());
     println!("Total    time: {:.5} s.", perf_total.as_secs_f32());
-    
+
     ExitCode::SUCCESS
 }
