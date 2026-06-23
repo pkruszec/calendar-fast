@@ -4,8 +4,8 @@ use std::io::{self, BufRead, BufReader, Error, ErrorKind, BufWriter, Write};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::cmp::Ordering;
-use std::thread;
-use std::sync::{mpsc};
+use std::collections::HashSet;
+use std::time::{Instant};
 
 #[derive(Clone, Copy)]
 #[derive(Debug)]
@@ -40,23 +40,20 @@ struct Doc {
 
 fn usage() {
     eprintln!(
-"usage: calendar_fast [-h|--help] [-v|--version] [-o <path>] [-p<n>] [--header <path>] [--start-date <date>] [--end-date <date>] <src_path>
-  -h, --help     print this and exit
-  -v, --version  print version number
-  -o             output path
-  -p<n>          parallelization mode
-    -p0            no parallelization
-    -p1            parallelize by first folder (experimental)
-    -p2            collect all paths and parallelize by files (experimental)
-  --header       header path (its contents will go to the beginning of the file)
-  --footer       footer path (its contents will go to the end of the file)
-  --start-date   start date (inclusive)
-  --end-date     end date (inclusive)
+"Usage: calendar-fast <src-paths> [options]
+  -h, --help                  Print the help message.
+  -v, --version               Print the version number and the build date.
+  -o             PATH         Output file.
+  --header       PATH         Header file.
+  --footer       PATH         Footer file.
+  --start-date   YYYY-MM-DD   Start date (inclusive).
+  --end-date     YYYY-MM-DD   End date (inclusive).
+  --imglink                   Replace images with links (will not work correctly on variable expansions).
 ");
 }
 
 fn version() {
-   eprintln!("calendar_fast build 2026-05-13");
+   eprintln!("calendar-fast 0.1.0, built on 2026-06-23.");
 }
 
 fn error(text: String) -> Error {
@@ -93,7 +90,7 @@ fn try_parse_date(date: &str) -> io::Result<Date> {
         }
 
         if !ok {
-            return Err(error(format!("could not parse date '{}'", date)));
+            return Err(error(format!("Could not parse date '{}'", date)));
         }
 
         Ok(Date {year, month, day})
@@ -112,7 +109,7 @@ fn try_parse_date_with_prefix(line: &str, prefix: &'static str) -> io::Result<Op
 
 static BOM: &'static str = unsafe { std::str::from_utf8_unchecked(&[0xEF, 0xBB, 0xBF]) };
 
-fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
+fn parse_doc(path: &Path, replace_images_with_links: bool) -> io::Result<Option<Doc>> {
     let file = File::open(path);
     if let Err(err) = file {
         return Err(error_with_file(path, err));
@@ -188,12 +185,12 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
 
         let mut pushed = false;
         if !comment {
-            const image_prefix: &str = "image::";
+            const IMAGE_PREFIX: &str = "image::";
 
-            if !line.starts_with("//") && line.contains(image_prefix) {
+            if replace_images_with_links && !line.starts_with("//") && line.contains(IMAGE_PREFIX) {
                 let mut line_replaced: Vec<u8> = Vec::new();
 
-                let prefix = image_prefix.as_bytes();
+                let prefix = IMAGE_PREFIX.as_bytes();
                 let buf = line.as_bytes();
                 let mut i = 0;
                 while i < buf.len() {
@@ -265,65 +262,11 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
     Ok(Some(doc))
 }
 
-fn traverse(path: &Path, out: &mut Vec<Doc>) -> io::Result<()> {
-    if path.is_dir() {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-            traverse(&path, out)?;
-        }
-    } else if path.is_file() {
-
-        let ext = path.extension();
-        if ext.is_none() {
-            return Ok(());
-        } else if let Some(ext) = ext {
-            if ext.to_str() != Some("adoc") {
-                return Ok(());
-            }
-        }
-
-        let doc = get_doc(path)?;
-        if let Some(doc) = doc {
-            out.push(doc);
-        }
-    }
-    Ok(())
-}
-
-fn collect_paths(path: &Path, out: &mut Vec<PathBuf>) {
-    if path.is_dir() {
-        for entry in fs::read_dir(path).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            collect_paths(&path, out);
-        }
-    } else if path.is_file() {
-        let ext = path.extension();
-
-        if let Some(ext) = ext {
-            if ext.to_str() == Some("adoc") {
-                out.push(path.to_path_buf());
-            }
-        }
-    }
-}
-
-fn send_paths(path: &Path, tx: &mpsc::Sender<PathBuf>) {
-    for entry in fs::read_dir(path).unwrap().filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_dir() {
-            send_paths(&path, tx);
-        } else if path.is_file() {
-            tx.send(path.to_path_buf()).unwrap();
-        }
-    }
-}
-
-fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item = &'a Doc>) -> io::Result<()> {
+fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item = &'a Doc>) -> io::Result<usize> {
     let file = File::create(path)?;
     let mut buf = BufWriter::new(file);
 
+    let mut count_generated = 0;
     
     buf.write(header.as_bytes())?;
     buf.write("\n\n:leveloffset: +1\n\n".as_bytes())?;
@@ -333,33 +276,67 @@ fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item
             let p = Path::new(&doc.path);
             // TODO: unwrap
             let parent = p.parent().unwrap().to_str().unwrap();
-            let parent_fwd = str::replace(parent, "\\", "/");
-            buf.write(format!(":imagesdir: {}\n", parent_fwd).as_bytes())?;
+            let mut parent = str::replace(parent, "\\", "/");
+
+            if let Some(s) = parent.strip_prefix("//?/") {
+                parent = s.to_string();
+            }
+            
+            buf.write(format!(":imagesdir: {}\n", parent).as_bytes())?;
         }
 
         buf.write(doc.content.as_bytes())?;
         buf.write("\n\n".as_bytes())?;
+
+        count_generated += 1;
     }
 
     buf.write("\n\n:leveloffset: -1\n\n".as_bytes())?;
     buf.write(footer.as_bytes())?;
 
+    Ok(count_generated)
+}
+
+fn get_adoc_files(path: &Path, files: &mut HashSet<PathBuf>) -> io::Result<()> {
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            get_adoc_files(&path, files)?;
+        }
+    } else if path.is_file() {
+        let ext = path.extension();
+        if ext.is_none() {
+            return Ok(());
+        } else if let Some(ext) = ext {
+            if ext.to_str() != Some("adoc") {
+                return Ok(());
+            }
+        }
+        files.insert(fs::canonicalize(path).unwrap());
+    }
+    
     Ok(())
 }
 
 fn main() -> ExitCode {
+    let perf_total = Instant::now();
+    
     let mut args = env::args();
     args.next().unwrap();
 
-    let mut src_dir: Option<String> = None;
+    let mut src_dirs: Vec<String> = Vec::new();
+    
     let mut out_path = String::from("calendar.adoc");
     let mut header_path: Option<String> = None;
     let mut footer_path: Option<String> = None;
-    let mut parallelize: i32 = 0;
-
+    
     let mut start_date = Date { year: 0, month: 0, day: 0 };
     let mut end_date = Date { year: u16::MAX, month: u8::MAX, day: u8::MAX };
-
+    let mut date_bounds_specified = false;
+    
+    let mut replace_images_with_links = false;
+    
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -371,74 +348,68 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--header" => {
-                // TODO: good error message
-                header_path = Some(args.next().unwrap());
+                match args.next() {
+                    Some(path) => header_path = Some(path),
+                    None => {
+                        eprintln!("Error: You typed --header, but didn't specify what the file is afterwards.");
+                        return ExitCode::from(1);
+                    },
+                }
             }
             "--footer" => {
-                // TODO: good error message
-                footer_path = Some(args.next().unwrap());
+                match args.next() {
+                    Some(path) => footer_path = Some(path),
+                    None => {
+                        eprintln!("Error: You typed --footer, but didn't specify what the file is afterwards.");
+                        return ExitCode::from(1);
+                    },
+                }
             }
             "-o" => {
-                // TODO: good error message
-                out_path = args.next().unwrap();
+                match args.next() {
+                    Some(path) => out_path = path,
+                    None => {
+                        eprintln!("Error: You typed -o, but didn't specify what the file is afterwards.");
+                        return ExitCode::from(1);
+                    },
+                }
             }
-            "-p0" => {
-                parallelize = 0;
-            }
-            "-p1" => {
-                parallelize = 1;
-            }
-            "-p2" => {
-                parallelize = 2;
-            }
-            // "-p3" => {
-            //     parallelize = 3;
-            // }
             "--start-date" => {
                 start_date = match try_parse_date(&args.next().unwrap()) {
-                    Ok(d) => d,
+                    Ok(d) => {
+                        date_bounds_specified = true;
+                        d
+                    },
                     Err(e) => {
-                        eprintln!("error: {e}");
+                        eprintln!("Error: {e}");
                         return ExitCode::from(1);
                     }
                 }
             }
             "--end-date" => {
                 end_date = match try_parse_date(&args.next().unwrap()) {
-                    Ok(d) => d,
+                    Ok(d) => {
+                        date_bounds_specified = true;
+                        d
+                    },
                     Err(e) => {
-                        eprintln!("error: {e}");
+                        eprintln!("Error: {e}");
                         return ExitCode::from(1);
                     }
                 }
             }
+            "--imglink" => {
+                replace_images_with_links = true;
+            }
             _ => {
-                if let Some(_) = src_dir {
-                    eprintln!("error: unexpected positional argument (multiple source directories are currently not supported)");
-                    return ExitCode::from(1);
-                } else {
-                    src_dir = Some(arg);
-                }
+                src_dirs.push(arg);
             }
         }
-    }
+   }
 
-    if let None = src_dir {
+    if src_dirs.len() == 0 {
         usage();
-        eprintln!("error: source directory not provided");
-        return ExitCode::from(1);
-    }
-
-    let src_dir = src_dir.unwrap();
-    let src_path = &Path::new(&src_dir);
-
-    if !src_path.exists() {
-        eprintln!("error: source directory does not exist");
-        return ExitCode::from(1);
-    }
-
-    if !src_path.is_dir() {
-        eprintln!("error: source path is not a directory");
+        eprintln!("Error: No source directories provided.");
         return ExitCode::from(1);
     }
 
@@ -456,119 +427,52 @@ fn main() -> ExitCode {
         String::from("")
     };
 
+    let perf_traverse = Instant::now();
+    
+    let mut files: HashSet<PathBuf> = HashSet::new();
+    
+    for dir in src_dirs {
+        let path = Path::new(&dir);
+        
+        if !path.exists() {
+            eprintln!("Error: Source directory '{}' does not exist.", path.display());
+            return ExitCode::from(1);
+        }
+
+        if !path.is_dir() {
+            eprintln!("Error: Source path '{}' is not a directory.", path.display());
+            return ExitCode::from(1);
+        }
+
+        match get_adoc_files(path, &mut files) {
+            Ok(_) => {},
+            Err(err) => {
+                eprintln!("Error: {err}");
+                return ExitCode::from(1);
+            }
+        };
+    }
+
+    let perf_traverse = perf_traverse.elapsed();
+    
+    println!("AsciiDoc files found: {}.", files.len());
+
+    let perf_parse = Instant::now();
+    
     let mut docs: Vec<Doc> = Vec::new();
-
-    match parallelize {
-        1 => {
-            let mut handles = Vec::new();
-        
-            for entry in fs::read_dir(src_path).unwrap() {
-                let entry = entry.unwrap();
-                let path = entry.path();
-        
-                let handle = thread::spawn(move || {
-                    let mut sub_docs: Vec<Doc> = Vec::new();
-                    traverse(&path, &mut sub_docs).unwrap();
-                    sub_docs
-                });
-        
-                handles.push(handle);
-            }
-        
-            for handle in handles {
-                let v = handle.join().unwrap();
-                docs.extend(v);
-            }
-        }
-        2 => {
-            let mut paths = Vec::new();
-            collect_paths(src_path, &mut paths);
-            
-            let mut handles = Vec::new();
-            let thread_count = 8;
-
-            let step = paths.len() / thread_count;
-
-            for i in 0..thread_count {
-                // Make the borrow checker shut up.
-                // Ugly, but it solves the problem without introducing any new artificial Rust structures. 
-                let paths = unsafe { &*(&paths[..] as *const [PathBuf]) };
-
-                let next = if i == thread_count - 1 {
-                    paths.len()
-                } else {
-                    (i+1)*step
-                };
-
-                let handle = thread::spawn(move || {
-                    let mut sub_docs: Vec<Doc> = Vec::new();
-
-                    for p in &paths[i*step .. next] {
-                        let doc = get_doc(p);
-                        if let Ok(Some(doc)) = doc {
-                            sub_docs.push(doc);
-                        }
-                    }
-
-                    sub_docs
-                });
-        
-                handles.push(handle);
-            }
-
-            for handle in handles {
-                let v = handle.join().unwrap();
-                docs.extend(v);
-            }
-        }
-        /*3 => {
-            let (tx, rx): (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>) = mpsc::channel();
-            let rx = Arc::new(Mutex::new(rx));
-
-            let thread_count = 16;
-            let mut handles = Vec::new();
-            for _ in 0..thread_count {
-                let rx = Arc::clone(&rx);
-                handles.push(thread::spawn(move || {
-                    let mut sub_docs: Vec<Doc> = Vec::new();
-                    loop {
-                        let msg = {
-                            let lock = rx.lock().unwrap();
-                            lock.recv()
-                        };
-                        match msg {
-                            Ok(p) => {
-                                let doc = get_doc(&p);
-                                if let Ok(Some(doc)) = doc {
-                                    sub_docs.push(doc);
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    sub_docs
-                }));
-            }
-
-            send_paths(src_path, &tx);
-            drop(tx);
-
-            for handle in handles {
-                let v = handle.join().unwrap();
-                docs.extend(v);
-            }
-        }*/
-        _ => {
-            match traverse(src_path, &mut docs) {
-                Ok(_) => {},
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    return ExitCode::from(1);
-                }
-            };
+    for path in files {
+        let doc = parse_doc(&path, replace_images_with_links).unwrap();
+        if let Some(doc) = doc {
+            docs.push(doc);
+        } else {
+            // It had include::[].
         }
     }
 
+    let perf_parse = perf_parse.elapsed();
+
+    let perf_output = Instant::now();
+    
     docs.sort_by(|a, b| {
         // Sort by revdates in descending order (newest on the top).
 
@@ -598,19 +502,34 @@ fn main() -> ExitCode {
         Ordering::Equal
     });
 
-    match generate(&out_path, &header, &footer, docs.iter().filter(|doc| {
+    let docs_filtered = docs.iter().filter(|doc| {
         if let Some(date) = doc.revdate {
             date.ge(&start_date) && date.le(&end_date)
         } else {
-            false
+            !date_bounds_specified
         }
-    })) {
-        Ok(_) => {},
+    });
+    
+    match generate(&out_path, &header, &footer, docs_filtered) {
+        Ok(count) => {
+            println!("Documents   included: {count}.");
+        },
         Err(err) => {
-            eprintln!("error: {err}");
+            eprintln!("Error: {err}");
             return ExitCode::from(1);
         }
     };
 
+    let perf_output = perf_output.elapsed();
+    
+    let perf_total = perf_total.elapsed();
+
+    println!("");
+    println!("Traverse time: {:.5} s.", perf_traverse.as_secs_f32());
+    println!("Parse    time: {:.5} s.", perf_parse.as_secs_f32());
+    println!("Output   time: {:.5} s.", perf_output.as_secs_f32());
+    println!("Other    time: {:.5} s.", (perf_total - (perf_traverse + perf_parse + perf_output)).as_secs_f32());
+    println!("Total    time: {:.5} s.", perf_total.as_secs_f32());
+    
     ExitCode::SUCCESS
 }

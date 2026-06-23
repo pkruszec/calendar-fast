@@ -1,6 +1,8 @@
+[#calendar-fast]
 = calendar-fast
-:revdate: 2025-02-14
+:revdate: 2026-06-23
 :author: Paweł Kruszec
 :email: pakruszec@gmail.com
 
-Faster version of link:https://github.com/pkruszec/vicx/blob/master/calendar.rb[calendar.rb].
+// Faster version of link:https://github.com/pkruszec/vicx/blob/master/calendar.rb[calendar.rb].
+
