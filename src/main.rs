@@ -2,9 +2,10 @@ use std::{env, u16};
 use std::process::ExitCode;
 use std::io::{self, BufRead, BufReader, Error, ErrorKind, BufWriter, Write};
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::cmp::Ordering;
 use std::thread;
+use std::sync::{mpsc};
 
 #[derive(Clone, Copy)]
 #[derive(Debug)]
@@ -46,6 +47,7 @@ fn usage() {
   -p<n>          parallelization mode
     -p0            no parallelization
     -p1            parallelize by first folder (experimental)
+    -p2            collect all paths and parallelize by files (experimental)
   --header       header path (its contents will go to the beginning of the file)
   --footer       footer path (its contents will go to the end of the file)
   --start-date   start date (inclusive)
@@ -54,7 +56,7 @@ fn usage() {
 }
 
 fn version() {
-   eprintln!("calendar_fast build 2025-08-27"); 
+   eprintln!("calendar_fast build 2026-05-13");
 }
 
 fn error(text: String) -> Error {
@@ -129,6 +131,8 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
         has_imagesdir: false,
     };
 
+    let mut doc_imagesdir: Option<String> = None;
+
     for (ln, line) in lines.enumerate() {
         if let Err(err) = line {
             return Err(error_with_file_and_line(path, ln, err));
@@ -182,16 +186,75 @@ fn get_doc(path: &Path) -> io::Result<Option<Doc>> {
             line_original = nb;
         }
 
-        doc.content.push_str(&line_original);
+        let mut pushed = false;
+        if !comment {
+            const image_prefix: &str = "image::";
+
+            if !line.starts_with("//") && line.contains(image_prefix) {
+                let mut line_replaced: Vec<u8> = Vec::new();
+
+                let prefix = image_prefix.as_bytes();
+                let buf = line.as_bytes();
+                let mut i = 0;
+                while i < buf.len() {
+                    if buf[i..].starts_with(prefix) {
+                        i += prefix.len();
+
+                        for c in "link:".bytes() {
+                            line_replaced.push(c);
+                        }
+
+                        if let Some(ref dir) = doc_imagesdir {
+                            for c in dir.bytes() {
+                                line_replaced.push(c);
+                            }
+
+                            let db = dir.as_bytes();
+                            if db[db.len() - 1] != b'/' {
+                                line_replaced.push(b'/');
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    line_replaced.push(buf[i]);
+                    i += 1;
+                }
+
+                if let Ok(line_replaced) = std::str::from_utf8(&line_replaced) {
+                    doc.content.push_str(line_replaced);
+                    pushed = true;
+                }
+            }
+        }
+
+        if !pushed { doc.content.push_str(&line_original); }
         doc.content.push_str("\n");
 
         if let Some(dir) = imagesdir {
+            doc_imagesdir = Some(dir.clone());
+
             doc.has_imagesdir = true;
 
+            // If it's a variable expansion, for example
+            //   {bucket}/{album}
+            // we don't override the imagesdir, because
+            // it may be a URL.
+            // The most reliable way of doing this would be to actually keep track of the
+            // variables in the document and expand them correctly, but that's some work.
+            let maybe_a_variable_expansion = dir
+                .chars()
+                .any(|c| c == '{' || c == '}');
+
             let p = Path::new(&dir);
+            // If we can safely assume this is a local path, we override the imagesdir
+            // with the actual path so that you can get to the image.
+            // TODO: This is not a very good way to determine if the path is a URL. 
             // HACK: unwrap
-            // TODO: Actual is url
-            if !p.has_root() && !p.starts_with("http://") && !p.starts_with("https://") {
+            if !maybe_a_variable_expansion && !p.has_root() &&
+               !p.starts_with("http://") && !p.starts_with("https://")
+            {
                 doc.content.push_str(":imagesdir: ");
                 doc.content.push_str(&str::replace(path.parent().unwrap().join(p).to_str().unwrap(), "\\", "/"));
                 doc.content.push_str("\n");
@@ -226,6 +289,35 @@ fn traverse(path: &Path, out: &mut Vec<Doc>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn collect_paths(path: &Path, out: &mut Vec<PathBuf>) {
+    if path.is_dir() {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            collect_paths(&path, out);
+        }
+    } else if path.is_file() {
+        let ext = path.extension();
+
+        if let Some(ext) = ext {
+            if ext.to_str() == Some("adoc") {
+                out.push(path.to_path_buf());
+            }
+        }
+    }
+}
+
+fn send_paths(path: &Path, tx: &mpsc::Sender<PathBuf>) {
+    for entry in fs::read_dir(path).unwrap().filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            send_paths(&path, tx);
+        } else if path.is_file() {
+            tx.send(path.to_path_buf()).unwrap();
+        }
+    }
 }
 
 fn generate<'a>(path: &str, header: &str, footer: &str, docs: impl Iterator<Item = &'a Doc>) -> io::Result<()> {
@@ -296,6 +388,12 @@ fn main() -> ExitCode {
             "-p1" => {
                 parallelize = 1;
             }
+            "-p2" => {
+                parallelize = 2;
+            }
+            // "-p3" => {
+            //     parallelize = 3;
+            // }
             "--start-date" => {
                 start_date = match try_parse_date(&args.next().unwrap()) {
                     Ok(d) => d,
@@ -360,34 +458,115 @@ fn main() -> ExitCode {
 
     let mut docs: Vec<Doc> = Vec::new();
 
-    if parallelize == 1 {
-        let mut handles = Vec::new();
-    
-        for entry in fs::read_dir(src_path).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-    
-            let handle = thread::spawn(move || {
-                let mut sub_docs: Vec<Doc> = Vec::new();
-                traverse(&path, &mut sub_docs).unwrap();
-                sub_docs
-            });
-    
-            handles.push(handle);
-        }
-    
-        for handle in handles {
-            let v = handle.join().unwrap();
-            docs.extend(v);
-        }
-    } else if parallelize == 0 {
-        match traverse(src_path, &mut docs) {
-            Ok(_) => {},
-            Err(err) => {
-                eprintln!("error: {err}");
-                return ExitCode::from(1);
+    match parallelize {
+        1 => {
+            let mut handles = Vec::new();
+        
+            for entry in fs::read_dir(src_path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+        
+                let handle = thread::spawn(move || {
+                    let mut sub_docs: Vec<Doc> = Vec::new();
+                    traverse(&path, &mut sub_docs).unwrap();
+                    sub_docs
+                });
+        
+                handles.push(handle);
             }
-        };
+        
+            for handle in handles {
+                let v = handle.join().unwrap();
+                docs.extend(v);
+            }
+        }
+        2 => {
+            let mut paths = Vec::new();
+            collect_paths(src_path, &mut paths);
+            
+            let mut handles = Vec::new();
+            let thread_count = 8;
+
+            let step = paths.len() / thread_count;
+
+            for i in 0..thread_count {
+                // Make the borrow checker shut up.
+                // Ugly, but it solves the problem without introducing any new artificial Rust structures. 
+                let paths = unsafe { &*(&paths[..] as *const [PathBuf]) };
+
+                let next = if i == thread_count - 1 {
+                    paths.len()
+                } else {
+                    (i+1)*step
+                };
+
+                let handle = thread::spawn(move || {
+                    let mut sub_docs: Vec<Doc> = Vec::new();
+
+                    for p in &paths[i*step .. next] {
+                        let doc = get_doc(p);
+                        if let Ok(Some(doc)) = doc {
+                            sub_docs.push(doc);
+                        }
+                    }
+
+                    sub_docs
+                });
+        
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                let v = handle.join().unwrap();
+                docs.extend(v);
+            }
+        }
+        /*3 => {
+            let (tx, rx): (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>) = mpsc::channel();
+            let rx = Arc::new(Mutex::new(rx));
+
+            let thread_count = 16;
+            let mut handles = Vec::new();
+            for _ in 0..thread_count {
+                let rx = Arc::clone(&rx);
+                handles.push(thread::spawn(move || {
+                    let mut sub_docs: Vec<Doc> = Vec::new();
+                    loop {
+                        let msg = {
+                            let lock = rx.lock().unwrap();
+                            lock.recv()
+                        };
+                        match msg {
+                            Ok(p) => {
+                                let doc = get_doc(&p);
+                                if let Ok(Some(doc)) = doc {
+                                    sub_docs.push(doc);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    sub_docs
+                }));
+            }
+
+            send_paths(src_path, &tx);
+            drop(tx);
+
+            for handle in handles {
+                let v = handle.join().unwrap();
+                docs.extend(v);
+            }
+        }*/
+        _ => {
+            match traverse(src_path, &mut docs) {
+                Ok(_) => {},
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::from(1);
+                }
+            };
+        }
     }
 
     docs.sort_by(|a, b| {
